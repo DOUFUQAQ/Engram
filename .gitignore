@@ -1,0 +1,19 @@
+# 密钥与本地配置 —— 绝不提交
+.env
+.env.local
+*.key
+credentials*.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# 运行产物
+*.log
+.cache/
+runs/
+out/
