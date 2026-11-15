@@ -63,6 +63,29 @@ python calibrate2.py                   # 参数扫描：稠密/稀疏/覆盖率�
 查询扩展 MRR 只 +0.02（在噪声范围内），而负样本拒绝率在多次运行中不稳定
 （开发集上观察到 2/3 ~ 3/3 波动）——**收益不显著 + 安全指标可能回退，所以默认关闭。**
 
+### 接上真嵌入与 LLM 重排之后（真实 API 实测）
+
+环境：火山方舟 Ark，嵌入 `doubao-embedding-vision-251215`（2048 维），
+重排 `deepseek-v4-1-flash-260910`。
+
+| 腿 | MRR | L1 @1 | L3 @1 | L3 @6 | NEG 拒绝 | 查询延迟 |
+|---|---|---|---|---|---|---|
+| `offline` 离线哈希 | 0.62 | 38% | 40% | 60% | 3/3 | **14 ms** |
+| `embed` 真嵌入 | 0.61 | 50% | 20% | 80% | 3/3 | 732 ms |
+| `embed+rerank` 真嵌入 + LLM 重排 | **0.75** | **88%** | **40%** | **80%** | 3/3 | 5.9 s |
+
+**两个和直觉相反的结论：**
+
+1. **真嵌入单独用几乎没收益**（MRR 0.62→0.61，稠密权重最优值是 **0**）。因为这套负载的查询
+   几乎都含唯一标识符（环境变量名、端口映射、迁移文件名、阈值数字），而稀疏路对精确标识符的
+   判别力已接近上限。但**配上重排后稠密信号就有用了**（`dense_w=0.25` 让 L3 MRR 0.44→0.59）：
+   稠密路负责把因果相关的神经元推进候选池，重排器负责确认。
+2. **真正的瓶颈是置信门，不是检索。** `debug_l3.py` 发现正确神经元在全库重排里常排第 1-2 名，
+   却被 0.35 的阈值拦在门外。标到 0.30 → @6 89%→95%、L3 MRR 0.32→0.46，负样本拒绝仍 100%。
+   再让**重排器可以翻案**（它读过原文，比稀疏分可信）→ MRR 0.71→**0.75**、L3 @6 60%→**80%**。
+
+这些数字都能自己复现：`python run_experiment.py`、`python sweep_gate.py`、`python debug_l3.py`。
+
 ## 三级降级策略
 
 | 级别 | 动作 | 实测成本 | 何时用 |
@@ -75,14 +98,20 @@ python calibrate2.py                   # 参数扫描：稠密/稀疏/覆盖率�
 
 | 文件 | 职责 |
 |---|---|
-| [hub.py](hub.py) | **核心**：`Cell`（神经元）、`Hub`（神经中枢）、置信门、外呼、突触、巩固、遗忘、二跳扩散 |
+| [hub.py](hub.py) | **核心**：`Cell`（神经元）、`Hub`（神经中枢）、置信门、外呼、突触、巩固、遗忘、二跳扩散、重排翻案 |
 | [context_packer.py](context_packer.py) | 工作区打包（热区+冷区+指针目录）、**记忆工具 `recall`**、四种策略同接口 |
+| [textutil.py](textutil.py) | 零依赖文本工具 + 离线兜底嵌入（`HashingEmbedder`） |
+| [embedder.py](embedder.py) | **在线嵌入**（兼容 3 种响应形态）+ **LLM 重排**（二分类）+ `.env` 解析 |
 | [metrics.py](metrics.py) | 指标：精确串存活率 |
 | [sim_session.py](sim_session.py) | 72 轮模拟编码会话 + 事故工作集定义 |
 | [bench_memory.py](bench_memory.py) | 主实验 / 记忆工具闭环 / 冷区扫描 |
 | [eval_holdout.py](eval_holdout.py) | 留出探针（L1 字面 / L2 概念 / L3 因果 / 负样本） |
 | [evaluate.py](evaluate.py) | 留出集评测：四条管线的排名对比 |
-| [calibrate.py](calibrate.py) [calibrate2.py](calibrate2.py) | 路由标定与参数扫描 |
+| [run_experiment.py](run_experiment.py) | **组件 A/B**：offline / 真嵌入 / +LLM重排 |
+| [sweep_gate.py](sweep_gate.py) [sweep_weights.py](sweep_weights.py) | 置信门与稠密权重的网格标定 |
+| [debug_l3.py](debug_l3.py) | L3 因果查询分段诊断（没召回 vs 被排掉 vs 被闸门拦下） |
+| [probe_provider.py](probe_provider.py) | 端点/模型探测器：自动找出 key 到底属于哪家、哪个模型可用 |
+| [calibrate.py](calibrate.py) [calibrate2.py](calibrate2.py) | 早期路由标定与融合参数扫描 |
 | [DESIGN.md](DESIGN.md) | 设计图纸、机制归因、边界与落地建议 |
 
 ## 最小用法

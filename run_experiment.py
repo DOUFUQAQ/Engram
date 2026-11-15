@@ -216,11 +216,11 @@ def main() -> None:
             cells += [f"{at1 * 100:>7.0f}%", f"{atk * 100:>7.0f}%"]
         mrr = r["rank"]["overall"][2]
         ws = r["ws"]
+        ws_str = f"{ws['working_set']}/{ws['working_set_total']}"
+        ex_str = f"{ws['exact']}/{ws['exact_total']}"
         print(f"{leg:<16}" + "".join(cells)
               + f"{mrr:>7.2f}{r['rank']['noans_n']:>7}"
-              + f"{f'{ws[chr(119)+chr(111)+chr(114)+chr(107)+chr(105)+chr(110)+chr(103)+chr(95)+chr(115)+chr(101)+chr(116)]}/{ws[chr(119)+chr(111)+chr(114)+chr(107)+chr(105)+chr(110)+chr(103)+chr(95)+chr(116)+chr(111)+chr(116)+chr(97)+chr(108)]}':>9}"
-              + f"{f'{ws[chr(101)+chr(120)+chr(97)+chr(99)+chr(116)]}/{ws[chr(101)+chr(120)+chr(97)+chr(99)+chr(116)+chr(95)+chr(116)+chr(111)+chr(116)+chr(97)+chr(108)]}':>9}"
-              + f"{r['rank']['query_ms']:>9.0f}")
+              + f"{ws_str:>9}{ex_str:>9}{r['rank']['query_ms']:>9.0f}")
     print("-" * 100)
 
     base = results.get("offline")

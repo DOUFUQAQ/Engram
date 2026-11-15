@@ -118,7 +118,7 @@ class Hub:
         embedder: Optional[HashingEmbedder] = None,
         *,
         top_k: int = 6,
-        conf_threshold: float = 0.35,
+        conf_threshold: float = 0.30,
         margin_threshold: float = 0.03,
         sure_threshold: float = 0.75,
         tau_floor: int = 220,
@@ -146,16 +146,32 @@ class Hub:
         self.drop_weight = drop_weight
         self.external_fn = external_fn      # 用户后续注入真实联网检索
         self.reranker: Optional[Any] = reranker   # ChatReranker（在线 LLM 重排，可选）
+        self.rerank_pool: int = 6             # 闸门被覆盖时，最多让重排器看几个候选
+        self._dense_weight_override: Optional[float] = None   # 标定用
         self._init_counters()
 
     @property
     def dense_weight(self) -> float:
-        """稠密路的权重。
+        """稠密路的权重（可被 self._dense_weight_override 覆盖，用于标定）。
 
-        离线哈希嵌入的稠密路实测无判别力（参数扫描一致给出 0），所以默认 0，
-        免得它污染正负分层；接入真嵌入后应调到 0.4~0.5 —— 这是"换组件"最直接的体现。
+        ⚠️ 实测结论（比预期复杂，如实记录）：
+        用 2048 维豆包嵌入做了 conf_threshold × dense_weight 网格扫描（sweep_gate.py）：
+
+            【无重排】dense_w=0.00 → MRR 0.64 / @6 95%   ← 最优
+                     dense_w=0.40 → MRR 0.61 / @6 84%   ← 变差
+            【有重排】dense_w=0.00 → MRR 0.74 / L3 0.44
+                     dense_w=0.25 → MRR 0.74 / L3 0.59  ← L3 明显更好，且 NEG 仍 100%
+                     dense_w=0.40 → MRR 0.73 / L3 0.39  ← 变差
+
+        读法：**稠密路单独用是噪声，配合重排才有价值**。
+        原因是这套负载的查询几乎都含唯一标识符（环境变量名、端口映射、迁移文件名、阈值数字），
+        稀疏路对精确标识符的判别力已接近上限；稠密余弦在"同义 0.62 / 无关 0.39"这种窄区间里，
+        单独投票只会稀释信号 —— 但它能把**因果相关的神经元推进候选池**，
+        再由重排器（读原文）确认。所以在线嵌入时给 0.25，离线时给 0。
         """
-        return 0.5 if self.emb_online else 0.0
+        if self._dense_weight_override is not None:
+            return self._dense_weight_override
+        return 0.25 if self.emb_online else 0.0
 
     def _llm_rerank(self, query: str, cands: Sequence[str]) -> Dict[str, float]:
         """把候选交给在线 LLM 打分（治因果链）。失败静默回退，绝不阻塞路由。"""
@@ -423,7 +439,7 @@ class Hub:
 
     def multi_route(self, task: str, *, max_probes: int = 5, per_probe: int = 3,
                     expand: bool = False, two_hop: bool = False,
-                    allow_external: bool = True,
+                    allow_external: bool = True, llm_global: bool = True,
                     spread: bool = False) -> Tuple[List[Trace], List[str]]:
         """多路脑电波：把复合任务拆成若干单实体探针，各自召回后再全局重排。
 
@@ -475,6 +491,18 @@ class Hub:
                 merged[best[0]] = merged.get(best[0], 0.0) + best[1]
 
         ordered = self.rerank(task, list(merged))
+        # 任务级 LLM 重排：**整批候选只调一次**，并且用原始任务当查询。
+        # 为什么不在每条探针里各调一次：① 5 倍成本；② 探针是碎片化的短句，
+        # 模型看不到全局语境，反而判不准（实测按探针调用收益不稳定）。
+        if llm_global:
+            pool = ordered[:max(self.reranker.max_candidates if self.reranker else 12, 12)]
+            llm = self._llm_rerank(task, pool)
+            if llm:
+                yes = [cid for cid in ordered if llm.get(cid, 0.0) >= 1.0]
+                rest = [cid for cid in ordered if cid not in yes]
+                ordered = yes + rest
+                for tr in traces:
+                    tr.reason = tr.reason.replace(" + LLM重排", "")
         head: List[str] = []
         for cid in per_probe_best:
             if cid not in head:
@@ -648,6 +676,24 @@ class Hub:
         tr.confidence, tr.margin = conf, margin
 
         if conf < self.conf_threshold:
+            # 重排器覆盖闸门：稀疏分低不代表没答案。
+            # 实测（sweep_gate.py + debug_l3.py）：L3 因果查询里正确神经元常在全库重排中排第 1-2 名，
+            # 却因为 conf 落在 0.31~0.34 被 0.30 的阈值拦下 —— 闸门成了瓶颈。
+            # 重排器**读过原文**，它的"yes"比稀疏分可信，所以允许它翻案。
+            # 但覆盖必须留证：只在重排确实判 yes 时生效，且 trace 里标明。
+            override = self._llm_rerank(query, [cid for cid, _ in confs[:self.rerank_pool]])
+            yes = [cid for cid in (c for c, _ in confs[:self.rerank_pool])
+                   if override.get(cid, 0.0) >= 1.0]
+            if yes:
+                tr.stage = "cell"
+                tr.reason = (f"闸门拦下(conf={conf:.3f})但重排判相关 → 覆盖，"
+                             f"重排命中 {len(yes)} 项")
+                tr.hits = [(cid, self._cell_rerank_score(query, self.cells[cid])) for cid in yes]
+                self.stats["local_hit"] += 1
+                self.stats["gate_overridden"] = self.stats.get("gate_overridden", 0) + 1
+                self._reinforce(yes)
+                tr.latency_ms = (time.perf_counter() - t0) * 1000
+                return tr
             tr.stage, tr.reason = "escalate", f"置信不足({conf:.3f}<{self.conf_threshold})"
             tr.partial = bool(confs)
             self._escalate(tr, query, allow_external)

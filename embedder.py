@@ -134,11 +134,23 @@ def _post_json(url: str, payload: dict, headers: Dict[str, str], timeout: float,
 # ---------------------------------------------------------------------------
 
 class EmbeddingProvider:
-    """OpenAI 兼容 /v1/embeddings 客户端。dim 由第一次调用探测后固定。"""
+    """OpenAI 兼容嵌入客户端，兼容三种"兼容"程度不同的实现。
+
+    实测遇到三种请求/响应形态（各家"OpenAI 兼容"其实不一样）：
+      ① 标准 OpenAI：请求 input=["a","b"]，响应 data=[{embedding:[...]}, ...]
+      ② 火山方舟 Ark：请求 input=[{"type":"text","text":"a"}]，
+         路径是 /embeddings/multimodal，响应 data={embedding:[...], object:"embedding"}
+         —— 注意 data 是**对象**而不是数组。Ark 的文本嵌入模型也走这个 multimodal 端点，
+         而 /embeddings 会直接返回 404 "model does not exist"，极易被误判成"没有嵌入能力"。
+      ③ 部分中转站：data 是数组但缺 index 字段。
+
+    api_path + 响应结构自动判别，调用方不需要关心。
+    """
 
     def __init__(self, base_url: str, api_key: str, model: str, *,
                  dim: Optional[int] = None, batch: int = 32, timeout: float = 30.0,
-                 query_prefix: str = "", doc_prefix: str = ""):
+                 query_prefix: str = "", doc_prefix: str = "",
+                 api_path: str = "/embeddings", input_style: str = "auto"):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
@@ -147,6 +159,10 @@ class EmbeddingProvider:
         # 有些模型（如 bge-m3 的 instruct 变体、E5 系列）要求给查询/文档加前缀
         self.query_prefix = query_prefix
         self.doc_prefix = doc_prefix
+        self.api_path = api_path or "/embeddings"
+        if input_style == "auto":
+            input_style = "multimodal" if "multimodal" in self.api_path else "openai"
+        self.input_style = input_style
         self.dim = dim or 0
         self.stats = HttpStats()
         self.df: Dict[int, int] = {}          # 为兼容 HashingEmbedder 的属性
@@ -168,14 +184,42 @@ class EmbeddingProvider:
         return n
 
     # ---------------------------------------------------------------- 调用
+    def _pack_input(self, chunk: List[str]) -> object:
+        if self.input_style == "multimodal":
+            return [{"type": "text", "text": t} for t in chunk]
+        return chunk
+
+    def _unpack(self, data: dict, chunk: List[str]) -> Tuple[Optional[List[List[float]]], str]:
+        """把两种响应结构都归一成 List[List[float]]。"""
+        raw = data.get("data")
+        if raw is None:
+            return None, "返回里没有 data 字段"
+        if isinstance(raw, dict):                      # Ark multimodal：data 是单个对象
+            v = raw.get("embedding")
+            if not v:
+                return None, "data 对象里没有 embedding"
+            return [[float(x) for x in v]], ""
+        if not isinstance(raw, list):
+            return None, f"data 结构未知: {type(raw).__name__}"
+        items = sorted(raw, key=lambda d: d.get("index", 0))
+        if len(items) != len(chunk):
+            return None, f"返回条数不匹配: 期望 {len(chunk)} 得到 {len(items)}"
+        out = []
+        for it in items:
+            v = it.get("embedding")
+            if not v:
+                return None, "条目里没有 embedding 字段"
+            out.append([float(x) for x in v])
+        return out, ""
+
     def _request(self, texts: Sequence[str]) -> Tuple[Optional[List[List[float]]], str]:
         if not self.api_key:
             return None, "EMBED_API_KEY 未配置"
-        url = f"{self.base_url}/embeddings"
+        url = f"{self.base_url}{self.api_path}"
         vecs: List[List[float]] = []
         for i in range(0, len(texts), self.batch):
             chunk = list(texts[i : i + self.batch])
-            payload = {"model": self.model, "input": chunk}
+            payload = {"model": self.model, "input": self._pack_input(chunk)}
             t0 = time.perf_counter()
             data, err = _post_json(url, payload,
                                    {"Authorization": f"Bearer {self.api_key}"}, self.timeout)
@@ -184,16 +228,13 @@ class EmbeddingProvider:
             if data is None:
                 self.stats.errors += 1
                 return None, err
-            items = data.get("data") or []
-            items = sorted(items, key=lambda d: d.get("index", 0))
-            if len(items) != len(chunk):
-                return None, f"返回条数不匹配: 期望 {len(chunk)} 得到 {len(items)}"
-            for it in items:
-                v = it.get("embedding")
-                if not v:
-                    return None, "返回里没有 embedding 字段"
-                vecs.append([float(x) for x in v])
-            usage = (data.get("usage") or {}).get("prompt_tokens")
+            got, perr = self._unpack(data, chunk)
+            if got is None:
+                self.stats.errors += 1
+                return None, perr
+            vecs.extend(got)
+            usage = (data.get("usage") or {}).get("prompt_tokens") or \
+                    (data.get("usage") or {}).get("total_tokens")
             if usage:
                 self.stats.embed_tokens += int(usage)
         return vecs, ""
@@ -264,24 +305,37 @@ class EmbeddingProvider:
 # ---------------------------------------------------------------------------
 
 _RERANK_SYS = (
-    "你是记忆检索的重排器。用户给出一个查询和若干编号的记忆片段，"
-    "你要判断每个片段与查询的相关程度，输出 0-10 的整数分数。\n"
-    "评分标准：\n"
-    "10 = 片段直接包含回答查询所需的事实（哪怕用词完全不同）\n"
-    "7-9 = 片段包含回答所需的背景或因果关系\n"
-    "3-6 = 同一主题但无直接帮助\n"
-    "0-2 = 无关\n"
-    "特别注意：查询里的现象可能是片段里某个配置或决策的**后果**，"
-    "这种因果关联必须给高分。只输出 JSON，不要任何解释。"
+    "你是记忆检索的相关性判定器。用户给出一个查询和若干编号的记忆片段。\n"
+    "对每个片段判断：**它是否包含回答这个查询所必需的信息？**\n"
+    "\n"
+    "判定为 yes 的情况：\n"
+    "· 片段直接含有查询要的那个事实（端口号、环境变量名、阈值、文件名、前缀……）；\n"
+    "· 片段含有解释查询里某个现象的**根因或相关约定**。\n"
+    "  特别注意：查询描述的是某个现象的**后果**，而片段里是导致它的配置或决策 —— 这是 yes。\n"
+    "  例：查询「用户停留 24 分钟就掉线」，片段里写着「session TTL 设为 25 分钟，前端心跳 20 分钟」→ yes\n"
+    "· 片段含有修复该问题需要的操作约定。\n"
+    "\n"
+    "判定为 no 的情况：\n"
+    "· 同一技术领域但对该查询没有帮助（例：查询「超时多少」，片段只讲「缓存前缀」）；\n"
+    "· 只是碰巧出现相同词汇但含义无关。\n"
+    "\n"
+    "只输出 JSON，不要解释，不要 Markdown 代码块。"
 )
 
 
 class ChatReranker:
-    """用 chat 模型给候选神经元打分。专治词面检索的因果链断裂。"""
+    """用 chat 模型判定候选神经元与查询的相关性。专治词面检索的因果链断裂。
+
+    设计选择（踩过坑）：
+      第一版是"打 0-10 分"。实测不可用 —— 7B~flash 这类模型给的分数几乎全在 8-10，
+      分辨力极差，重排等于没排。改成**二分类 yes/no** 后稳定得多：
+      模型对"这段是否包含回答所需信息"的判断远比"打几分"可靠。
+    """
 
     def __init__(self, base_url: str, api_key: str, model: str, *,
                  timeout: float = 60.0, max_candidates: int = 12,
-                 snippet_chars: int = 600, enabled: bool = True):
+                 snippet_chars: int = 600, enabled: bool = True,
+                 mode: str = "binary"):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
@@ -289,6 +343,7 @@ class ChatReranker:
         self.max_candidates = max_candidates
         self.snippet_chars = snippet_chars
         self.enabled = enabled and bool(api_key)
+        self.mode = mode                     # binary | score
         self.stats = HttpStats()
         self.cache: Dict[Tuple[str, str], float] = {}
 
@@ -298,12 +353,64 @@ class ChatReranker:
             body = text[: self.snippet_chars]
             blocks.append(f"### 片段{i} (id={cid})\n{body}")
         ids = ", ".join(f'"{cid}"' for cid, _ in cands)
-        return (f"查询：{query}\n\n" + "\n\n".join(blocks)
-                + f"\n\n输出 JSON，键是片段 id，值是 0-10 整数分数，必须包含这些键：{ids}。"
-                  f'\n格式示例：{{"N0001": 9, "N0002": 3}}')
+        if self.mode == "binary":
+            ask = (f"\n\n输出 JSON，键是片段 id，值是 \"yes\" 或 \"no\"，必须包含这些键：{ids}。"
+                   f'\n格式示例：{{"N0001": "yes", "N0002": "no"}}')
+        else:
+            ask = (f"\n\n输出 JSON，键是片段 id，值是 0-10 整数分数，必须包含这些键：{ids}。"
+                   f'\n格式示例：{{"N0001": 9, "N0002": 3}}')
+        return f"查询：{query}\n\n" + "\n\n".join(blocks) + ask
+
+    @staticmethod
+    def _salvage(content: str) -> Optional[dict]:
+        """从被截断/带包裹的输出里抢救 JSON。
+
+        模型有时会输出 ```json ... ``` 或先啰嗦一句再给 JSON，
+        更常见的是 max_tokens 截断导致末尾缺 }。这里按最外层花括号截取并补齐。
+        """
+        if not content:
+            return None
+        text = content.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+            text = re.sub(r"\s*```\s*$", "", text)
+        start = text.find("{")
+        if start < 0:
+            return None
+        body = text[start:]
+        for attempt in range(3):
+            candidate = body + "}" * attempt
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                continue
+        # 最后一招：逐对抓 "id": value
+        pairs = re.findall(r'"([A-Za-z0-9_]+)"\s*:\s*("?)(yes|no|true|false|\d+(?:\.\d+)?)\2', body)
+        return {k: v for k, _, v in pairs} if pairs else None
+
+    def _parse(self, parsed: dict, cid: str) -> Optional[float]:
+        v = parsed.get(cid)
+        if isinstance(v, bool):
+            return 1.0 if v else 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("yes", "true", "y", "是", "相关"):
+                return 1.0
+            if s in ("no", "false", "n", "否", "不相关"):
+                return 0.0
+            if re.fullmatch(r"\d+(\.\d+)?", s):
+                return float(s)
+        return None
 
     def score(self, query: str, cands: List[Tuple[str, str]]) -> Dict[str, float]:
-        """返回 {cell_id: 0-10}。任何失败都返回空字典（调用方回退到词面名次）。"""
+        """返回 {cell_id: 相关度}（binary 模式下 yes=1.0 / no=0.0）。
+
+        任何失败都返回空字典 —— 调用方回退到词面名次，绝不阻塞路由。
+        """
         if not self.enabled or not cands:
             return {}
         cands = cands[: self.max_candidates]
@@ -315,6 +422,10 @@ class ChatReranker:
                              {"role": "user", "content": self._prompt(query, todo)}],
                 "temperature": 0,
                 "response_format": {"type": "json_object"},
+                # 实测教训：max_tokens 给小了会把 JSON 截断，报成"调用失败"。
+                # 12 个候选的 yes/no JSON 大约 100 token，但模型有时会先啰嗦一段，
+                # 给 1500 才稳。截断的 JSON 无法解析 → 整批重排白跑。
+                "max_tokens": 1500,
             }
             t0 = time.perf_counter()
             data, err = _post_json(f"{self.base_url}/chat/completions", payload,
@@ -324,18 +435,24 @@ class ChatReranker:
             if data is None:
                 self.stats.errors += 1
                 return {}
+            parsed = None
+            content = ""
             try:
                 content = data["choices"][0]["message"]["content"]
                 parsed = json.loads(content)
             except Exception:
+                parsed = self._salvage(content)
+            if not isinstance(parsed, dict):
                 self.stats.errors += 1
+                if len(todo) > 4:
+                    # 整批失败时降半重试一次：候选越少越不容易被截断
+                    self.stats.retries += 1
+                    return self.score(query, cands[: max(4, len(cands) // 2)])
                 return {}
-            for cid, txt in todo:
-                v = parsed.get(cid)
-                if isinstance(v, (int, float)):
-                    self.cache[(query, cid)] = float(v)
-                elif isinstance(v, str) and re.fullmatch(r"\d+(\.\d+)?", v.strip()):
-                    self.cache[(query, cid)] = float(v.strip())
+            for cid, _ in todo:
+                v = self._parse(parsed, cid)
+                if v is not None:
+                    self.cache[(query, cid)] = v
         return {cid: self.cache[(query, cid)] for cid, _ in cands if (query, cid) in self.cache}
 
 
@@ -393,6 +510,8 @@ def build_components(env_path: str = ".env", *, prefer_online: bool = True,
             timeout=_env_float("EMBED_TIMEOUT", 30.0),
             query_prefix=_env("EMBED_QUERY_PREFIX"),
             doc_prefix=_env("EMBED_DOC_PREFIX"),
+            api_path=_env("EMBED_API_PATH", "/embeddings"),
+            input_style=_env("EMBED_INPUT_STYLE", "auto"),
         )
     else:
         if strict:
