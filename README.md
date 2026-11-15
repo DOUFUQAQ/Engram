@@ -103,6 +103,20 @@ print(packed.trace.describe())                            # 命中谁 / 置信 /
 rp = writer.recall("session TTL 过期时间是多少？")          # L2 记忆工具（暴露给模型）
 ```
 
+## 上线到 GitHub
+
+仓库已经带完整提交历史（7 个提交，按"内核 → 打包 → 基准 → 标定 → 评测 → 组件 → 文档"分层）：
+
+```bash
+cd F:\memory
+git log --oneline                     # 确认历史
+# 在 GitHub 上新建空仓库（不要勾选 README/gitignore），然后：
+git remote add origin git@github.com:<你的用户名>/<仓库名>.git
+git push -u origin main
+```
+
+`.env` 被 `.gitignore` 挡住，密钥不会进仓库；`.env.example` 会进仓库，作为配置模板。
+
 ## 四个已踩过的坑（别重复踩）
 
 1. **噪声污染神经元**：关键约定出现在每一轮的工具输出里 → 所有神经元"都包含"它 → 检索失去分辨力。
