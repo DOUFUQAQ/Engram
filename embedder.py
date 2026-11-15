@@ -150,12 +150,15 @@ class EmbeddingProvider:
     def __init__(self, base_url: str, api_key: str, model: str, *,
                  dim: Optional[int] = None, batch: int = 32, timeout: float = 30.0,
                  query_prefix: str = "", doc_prefix: str = "",
-                 api_path: str = "/embeddings", input_style: str = "auto"):
+                 api_path: str = "/embeddings", input_style: str = "auto",
+                 force_single: Optional[bool] = None):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.batch = batch
         self.timeout = timeout
+        # 有些端点（实测：火山方舟）不支持真正的多文本批量 → 强制逐条
+        self.force_single = bool(force_single) if force_single is not None else False
         # 有些模型（如 bge-m3 的 instruct 变体、E5 系列）要求给查询/文档加前缀
         self.query_prefix = query_prefix
         self.doc_prefix = doc_prefix
@@ -251,12 +254,37 @@ class EmbeddingProvider:
         return v
 
     def embed_batch(self, texts: Sequence[str], *, prefix: str = "") -> List[List[float]]:
-        """批量嵌入（入库用）。比逐条快一个数量级。"""
+        """批量嵌入（入库用）。
+
+        ⚠️ 实测的第四个兼容坑：**火山方舟对多文本 input 只返回 1 个向量**
+        （它把整个 input 数组当成"一个多模态片段"聚合了）。
+        如果我们天真地按 batch=32 发，就会静默拿到 1 个向量、丢掉 31 个 ——
+        而且不会报错，索引里一半神经元没有向量，检索质量悄悄降级。
+        所以这里强制校验返回值与请求数一致；不一致就逐条重发。
+        """
         if prefix:
             texts = [prefix + t for t in texts]
-        vecs, err = self._request(list(texts))
+        texts = list(texts)
+        if not texts:
+            return []
+        if self.force_single:
+            out: List[List[float]] = []
+            for t in texts:
+                v, err = self._request([t])
+                if v is None:
+                    raise RuntimeError(f"批量嵌入失败: {err}")
+                out.extend(v)
+            if out and not self.dim:
+                self.dim = len(out[0])
+            return out
+        vecs, err = self._request(texts)
         if vecs is None:
             raise RuntimeError(f"批量嵌入失败: {err}")
+        if len(vecs) != len(texts):
+            # 端点不支持真正的批量 → 退回逐条，并记住这个事实
+            self.force_single = True
+            self.stats.retries += 1
+            return self.embed_batch([t for t in texts], prefix="")
         if vecs and not self.dim:
             self.dim = len(vecs[0])
         return vecs
@@ -512,6 +540,7 @@ def build_components(env_path: str = ".env", *, prefer_online: bool = True,
             doc_prefix=_env("EMBED_DOC_PREFIX"),
             api_path=_env("EMBED_API_PATH", "/embeddings"),
             input_style=_env("EMBED_INPUT_STYLE", "auto"),
+            force_single=(_env("EMBED_FORCE_SINGLE", "1") not in ("0", "false", "False")),
         )
     else:
         if strict:
