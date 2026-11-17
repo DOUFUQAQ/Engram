@@ -17,3 +17,15 @@ venv/
 .cache/
 runs/
 out/
+
+# ============================================================================
+# 评测数据（体积大，靠 fetch_benchmarks.py 下载，不入库）
+# 注意：不整体忽略 bench_data/，否则连它的 README.md 都进不来。
+# ============================================================================
+bench_data/*.pkl
+bench_data/longmemeval_*.json
+bench_data/locomo*.json
+bench_data/_asar_index.json
+
+# 从 app.asar 抽出的第三方（DSH）代码 —— 仅本地调研用，绝不可发布
+dsh_src/

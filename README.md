@@ -1,34 +1,65 @@
-# memory —— 「神经元 + 神经中枢」记忆架构原型
+# Engram · 保真的长会话记忆层
+
+> **Engram keeps the trace, activates sparsely.** —— 留下痕迹，稀疏激活。
 
 一个针对"编码 agent 跑到 40 轮就飘忽"的可运行原型。
 核心主张：**记忆的存储必须保真（神经元冻结原文），压缩只发生在当前工作区，
 且必须能指回原件（指针内存）。**
 
-完整设计、实测数据、以及这个想法的边界 → **[DESIGN.md](DESIGN.md)**
+**先说结论（在公开评测集 LongMemEval-S 上 120 条实测）：**
+
+| | 检索 Recall@8 | 保真（关键串保留） | 上下文 tokens |
+|---|---|---|---|
+| 压缩摘要（真实 agent 今天的做法） | 94.2% | **10.8%** | 4 |
+| RAG（固定窗口+BM25） | 92.0% | 未测 | 2,252 |
+| **Engram（本项目）** | 91.0% | **87.1%** | 17,823 |
+| 全量原文 | 100% | 94.0% | 139,366 ← 不可行 |
+
+```
+保真  87.1% vs 压缩 10.8%      +76.3pp  p<0.01   极显著
+保真  87.1% vs 全量原文 94.0%   −6.9pp  p=0.068  无显著差异
+检索  91.0% vs 压缩 94.2%      −3.2pp  p=0.344  无显著差异
+```
+
+> **用"和压缩无显著差异的检索质量"，换来"和全量原文无显著差异的保真度"，
+> 成本是全量原文的 1/7.8。**
+
+**同时也要说清它做不到什么**：作为**检索器**，它与调好参数的 RAG 无统计显著差异
+（120 条，`p=0.479`，RAG 的 Recall 还略高），而且贵 7.5 倍。
+**它不是"更准的检索器"，而是"压缩的替代品"** —— 详见 [DESIGN.md](DESIGN.md) §3.4–3.8。
+
+完整设计、机制归因、实测数据与边界 → **[DESIGN.md](DESIGN.md)**
 
 ## 快速开始
 
 ```bash
-cd F:\memory
+git clone <你的仓库地址> && cd memory
 
-# 真嵌入 / LLM 重排（可选，见 .env.example）
-copy .env.example .env      # Windows   （Linux/mac: cp .env.example .env）
-#   然后填入 EMBED_*（推荐 BGE-M3）与 DEEPSEEK_*
-python run_experiment.py --check          # 先做组件连通性体检
-python run_experiment.py                  # A/B：offline vs 真嵌入 vs +LLM重排
-
-# 离线即可跑（不需要任何 key）
+# ① 离线即可跑（不需要任何 key）
 python bench_memory.py                 # 主实验：四种上下文策略对比
-python bench_memory.py --only cells --verbose   # 只看本方案，并打印最终打包内容
-python bench_memory.py --recall-loop   # 记忆工具闭环（收益最大的一步）
+python bench_memory.py --recall-loop   # 记忆工具闭环（收益最大的一步：工作集 3/6→6/6）
 python bench_memory.py --sweep-cold    # 冷区数量的成本-收益曲线
 python evaluate.py                     # 留出集：四条管线的排名对比（L1/L2/L3/负样本）
-python evaluate.py -v                  # 逐条看命中情况
 python calibrate.py                    # 路由标定：正负样本能否分层
-python calibrate2.py                   # 参数扫描：稠密/稀疏/覆盖率权重与阈值
+
+# ② 公开评测集（需要下载数据，见下）
+python fetch_benchmarks.py             # 下载 LongMemEval（走 hf-mirror 镜像）
+python eval_longmemeval.py --per-type 5 --topk 8 --budget 18000   # 30 条，约 20 分钟
+python eval_compaction.py  --per-type 20 --topk 8 --budget 18000  # 120 条压缩腿
+python significance.py --lme           # 显著性检验
+
+# ③ 真嵌入 / LLM 重排（可选，需自备 key）
+copy .env.example .env      # Windows   （Linux/mac: cp .env.example .env）
+python probe_provider.py               # 先探出你的 key 属于哪家、哪些模型可用
+python run_experiment.py --check       # 组件连通性体检
+python run_experiment.py               # A/B：offline vs 真嵌入 vs +LLM重排
 ```
 
-`.env` 已在 `.gitignore` 里，密钥不会被提交。
+**依赖：零依赖。** 纯 Python 标准库（Python 3.9+）。真嵌入与 LLM 重排是可选的，
+走 `.env` 配置任何 OpenAI 兼容端点。
+
+`.env` 已在 `.gitignore` 里，密钥不会被提交；
+`bench_data/` 的大文件与缓存也不会入仓库（用 `fetch_benchmarks.py` 下载）。
 
 ## 实测结果
 
