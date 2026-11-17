@@ -234,17 +234,31 @@ rp = writer.recall("session TTL 过期时间是多少？")          # L2 记忆�
 
 ## 上线到 GitHub
 
-仓库已经带完整提交历史（7 个提交，按"内核 → 打包 → 基准 → 标定 → 评测 → 组件 → 文档"分层）：
+仓库已带完整提交历史（15 个提交，按"内核 → 打包 → 基准 → 标定 → 评测 → 组件 → 文档 → 发布"分层），
+**体积 0.2 MB、最大文件 54 KB**，可直接推送。
 
 ```bash
-cd F:\memory
-git log --oneline                     # 确认历史
-# 在 GitHub 上新建空仓库（不要勾选 README/gitignore），然后：
+# 1. 在 GitHub 上新建空仓库（不要勾选 README / .gitignore / License）
+# 2. 关联并推送（SSH）
 git remote add origin git@github.com:<你的用户名>/<仓库名>.git
+git push -u origin main
+
+# 或用 HTTPS（会提示输入用户名 + Personal Access Token）
+git remote add origin https://github.com/<你的用户名>/<仓库名>.git
 git push -u origin main
 ```
 
-`.env` 被 `.gitignore` 挡住，密钥不会进仓库；`.env.example` 会进仓库，作为配置模板。
+**仓库里有什么 / 没有什么：**
+
+| | 状态 |
+|---|---|
+| 源码 + 文档 + LICENSE | ✅ 入库（29 个文件） |
+| `.env`（API key） | ❌ 被 `.gitignore` 挡住 |
+| `bench_data/` 大文件（评测集 270MB、向量缓存 280MB） | ❌ 不入库，用 `python fetch_benchmarks.py` 下载 |
+| `dsh_src/`（从 `app.asar` 抽出的 DSH 代码） | ❌ 不入库（第三方专有代码），仅本地调研用 |
+
+> 注：仓库历史被重写过一次，用来剔除误提交的大文件（否则 `.git` 达 332MB，
+> GitHub 单文件硬限 100MB 会直接拒收）。如果你有更早的克隆，需要重新 clone。
 
 ## 四个已踩过的坑（别重复踩）
 
